@@ -1,0 +1,203 @@
+---
+title: "Exercise 20"
+author: "Marc Dotson"
+format: docx
+---
+
+One last time, return to the data from the previous three exercises.
+
+1. Build a logistic regression, decision tree, random forest, boosted tree, and a neural network as well as a stacking ensemble with all five of the model types as candidates. Use the same random training and testing split.
+2. Create a table comparing all six models. Which is the best-fitting model? Why do you think its the best-fitting model for this specific problem?
+3. Render the Quarto document into Word and upload to Canvas.
+
+**Five points total, one point each for:**
+
+- **Fitting a logistic regression, tuned decision tree, tuned random forest, tuned boosted tree, and tune neural network using the same resampled training data.**
+- **Fitting a stacked ensemble using all of the previous models as candidates.**
+- **Creating a table to compare all of the models on the same testing data.**
+- **An explanation as to why they think the best-fitting model is best for this specific problem.**
+- **Submitting a rendered Word document.**
+
+## Data Prep and Feature Engineering
+
+We are again encoding `segment` as two categories and using the same predictors as before.
+
+```{r}
+# Load packages and functions.
+library(tidyverse)
+library(tidymodels)
+library(stacks)
+
+fit_accuracy <- function(fit, testing_data, truth) {
+  fit |> 
+    predict(new_data = testing_data) |>
+    bind_cols(testing_data) |>
+    accuracy(truth = {{truth}}, estimate = .pred_class)
+}
+
+# Set a seed.
+set.seed(97)
+
+# Import data and wrangle S1 into segment.
+roomba_survey <- read_csv(here::here("Data", "roomba_survey.csv")) |> 
+  rename(segment = S1) |> 
+  mutate(
+    segment = case_when(
+      segment == 1 ~ "own or shopping",
+      segment == 3 ~ "own or shopping",
+      segment == 4 ~ "considering"
+    ),
+    segment = factor(segment)
+  )
+
+# Split data based on segment.
+roomba_split <- initial_split(roomba_survey, prop = 0.75, strata = segment)
+
+# Use v-fold cross-validation based on segment.
+roomba_cv <- vfold_cv(training(roomba_split), v = 10, strata = segment)
+
+# Feature engineering.
+roomba_recipe <- training(roomba_split) |>
+  recipe(
+    segment ~ CleaningAttitudes_1 + CleaningAttitudes_2 + CleaningAttitudes_3 + 
+      CleaningAttitudes_4 + CleaningAttitudes_5 + CleaningAttitudes_6 + 
+      CleaningAttitudes_7 + CleaningAttitudes_8 + CleaningAttitudes_9 + 
+      CleaningAttitudes_10 + CleaningAttitudes_11 +
+      D1Gender + D2HomeType + D3Neighborhood + D4MaritalStatus
+  ) |>
+  step_dummy(all_nominal_predictors()) |> 
+  step_normalize(all_predictors())
+```
+
+## Fit Models
+
+Let's fit all of the competing models on the same resampled training data.
+
+```{r}
+# Logistic regression.
+roomba_lr <- logistic_reg() |> 
+  set_engine(engine = "glm")
+
+roomba_wf_lr <- workflow() |> 
+  add_recipe(roomba_recipe) |> 
+  add_model(roomba_lr)
+
+resample_lr <- roomba_wf_lr |> 
+  fit_resamples(
+    resamples = roomba_cv,
+    control = control_stack_resamples()
+  )
+
+fit_lr <- roomba_wf_lr |> 
+  fit(data = training(roomba_split))
+
+# Decision tree.
+roomba_dt <- decision_tree(tree_depth = tune(), min_n = tune()) |> 
+  set_engine(engine = "rpart") |> 
+  set_mode("classification")
+
+roomba_wf_dt <- roomba_wf_lr |> 
+  update_model(roomba_dt)
+
+tune_dt <- roomba_wf_dt |> 
+  tune_grid(
+    resamples = roomba_cv,
+    control = control_stack_grid()
+  )
+
+fit_dt <- roomba_wf_dt |> 
+  finalize_workflow(select_best(tune_dt, metric = "accuracy")) |> 
+  fit(data = training(roomba_split))
+
+# Random forest.
+roomba_rf <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) |> 
+  set_engine(engine = "randomForest") |> 
+  set_mode("classification")
+
+roomba_wf_rf <- roomba_wf_dt |> 
+  update_model(roomba_rf)
+
+tune_rf <- roomba_wf_rf |> 
+  tune_grid(
+    resamples = roomba_cv,
+    control = control_stack_grid()
+  )
+
+fit_rf <- roomba_wf_rf |> 
+  finalize_workflow(select_best(tune_rf, metric = "accuracy")) |> 
+  fit(data = training(roomba_split))
+
+# Boosted tree.
+roomba_bt <- boost_tree(
+  tree_depth = tune(), trees = tune(), learn_rate = tune(), 
+  mtry = tune(), min_n = tune(), sample_size = tune()
+) |>
+  set_engine("xgboost") |> 
+  set_mode("classification")
+
+roomba_wf_bt <- roomba_wf_dt |> 
+  update_model(roomba_bt)
+
+tune_bt <- roomba_wf_bt |> 
+  tune_grid(
+    resamples = roomba_cv,
+    control = control_stack_grid()
+  )
+
+fit_bt <- roomba_wf_bt |> 
+  finalize_workflow(select_best(tune_bt, metric = "accuracy")) |>
+  fit(data = training(roomba_split))
+
+# Neural network.
+roomba_nn <- mlp(hidden_units = tune(), epochs = tune(), penalty = tune()) |> 
+  set_engine(engine = "nnet") |> 
+  set_mode("classification")
+
+roomba_wf_nn <- roomba_wf_dt |>
+  update_model(roomba_nn)
+
+tune_nn <- roomba_wf_nn |> 
+  tune_grid(
+    resamples = roomba_cv,
+    control = control_stack_grid()
+  )
+
+fit_nn <- roomba_wf_nn |> 
+  finalize_workflow(select_best(tune_nn, metric = "accuracy")) |> 
+  fit(data = training(roomba_split))
+
+# Stack of candidate ensemble members.
+roomba_stack <- stacks() |> 
+  add_candidates(resample_lr) |> 
+  add_candidates(tune_dt) |> 
+  add_candidates(tune_rf) |> 
+  add_candidates(tune_bt) |>
+  add_candidates(tune_nn)
+
+# Aggregate predictions.
+fit_stack <- roomba_stack |> 
+  blend_predictions() |> 
+  fit_members()
+```
+
+## Compare Predictive Fit
+
+Let's create a table to compare predictive fit using a function.
+
+```{r}
+# Create a table of predictive fit.
+bind_cols(
+  model = c("lr", "dt", "rf", "bt", "nn", "stack"),
+  bind_rows(
+    fit_accuracy(fit_lr, testing(roomba_split), segment),
+    fit_accuracy(fit_dt, testing(roomba_split), segment),
+    fit_accuracy(fit_rf, testing(roomba_split), segment),
+    fit_accuracy(fit_bt, testing(roomba_split), segment),
+    fit_accuracy(fit_nn, testing(roomba_split), segment),
+    fit_accuracy(fit_stack, testing(roomba_split), segment)
+  )
+)
+```
+
+The random forest and the boosted tree tie for best predictive accuracy. These are hard to beat! It allows the flexibility of simple models with the benefit of an ensemble. It’s interesting that both approaches arrive with the same predictive fit. Clearly the added complexity of the neural net, and the ensemble of ensembles that is stacking, wasn’t needed for this specific application.
+
